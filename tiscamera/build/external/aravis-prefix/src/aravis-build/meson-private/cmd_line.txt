@@ -1,0 +1,11 @@
+[options]
+viewer = disabled
+gst-plugin = disabled
+fast-heartbeat = false
+documentation = disabled
+introspection = disabled
+default_library = static
+usb = enabled
+
+[properties]
+
