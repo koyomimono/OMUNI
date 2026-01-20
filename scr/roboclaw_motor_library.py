@@ -7,8 +7,8 @@ MAX_SPEED = 30
 MIN_SPEED = -30
 
 # RoboClaw初期化（グローバルに保持）
-roboclaw1 = Roboclaw("/dev/ttyACM0", 115200)
-roboclaw2 = Roboclaw("/dev/ttyACM1", 115200)
+roboclaw1 = Roboclaw("/dev/roboclaw2", 115200)
+roboclaw2 = Roboclaw("/dev/roboclaw1", 115200)
 roboclaw1.Open()
 roboclaw2.Open()
 
