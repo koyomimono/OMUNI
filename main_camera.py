@@ -8,7 +8,7 @@ from mouse_tracking import MouseTracker
 from scr.roboclaw_motor_library import motor_m1, motor_m2, motor_m3, motor_m4, stop_all
 
 # ----------------------- 설정 -----------------------
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 WIDTH, HEIGHT = 640, 480
 FPS = 30
 DT = 1.0 / FPS
@@ -160,9 +160,9 @@ if __name__ == "__main__":
                 offset_x, offset_y, s1, s2, s3, s4 = calculate_offset(center, angle_rad)
 
                 motor_m1(int(s1))
-                motor_m2(int(s2))
-                motor_m3(int(s3))
-                motor_m4(int(s4))
+                #motor_m2(int(s2))
+                #motor_m3(int(s3))
+                #motor_m4(int(s4))
 
                 cv2.circle(frame_cropped, center, 5, (0, 255, 0), -1)
                 cv2.putText(frame_cropped, f"(x,y)=({offset_x:.2f},{offset_y:.2f})", (10, 60),

@@ -72,17 +72,17 @@ def motor_m1(speed):
     """モーター1を制御"""
     speed = clamp_speed(speed)
     if speed >= 0:
-        roboclaw1.ForwardM2(ADDRESS, speed)
+        roboclaw1.ForwardM1(ADDRESS, speed)
     else:
-        roboclaw1.BackwardM2(ADDRESS, abs(speed))
+        roboclaw1.BackwardM1(ADDRESS, abs(speed))
 
 def motor_m2(speed):
     """モーター2を制御"""
     speed = clamp_speed(speed)
     if speed >= 0:
-        roboclaw2.BackwardM2(ADDRESS, speed)
+        roboclaw1.ForwardM2(ADDRESS, speed)
     else:
-        roboclaw2.ForwardM2(ADDRESS, abs(speed))
+        roboclaw1.BackwardM2(ADDRESS, abs(speed))
 
 def motor_m3(speed):
     """モーター3を制御"""
@@ -96,6 +96,6 @@ def motor_m4(speed):
     """モーター4を制御"""
     speed = clamp_speed(speed)
     if speed >= 0:
-        roboclaw1.BackwardM1(ADDRESS, speed)
+        roboclaw2.BackwardM2(ADDRESS, speed)
     else:
-        roboclaw1.ForwardM1(ADDRESS, abs(speed))
+        roboclaw2.ForwardM2(ADDRESS, abs(speed))

@@ -1,59 +1,97 @@
+# main.py
+# 三輪120°オムニホイール制御（位置PID＋角度PID→ω→各輪配分）．
+# 変更点：
+# - 's' で駆動開始（それまでPIDの積分・微分は計算しない）．
+# - 駆動開始から10秒間のステップ応答をCSV保存．
+# - 10秒経過で自動停止＆CSVフラッシュ．
+
 import time
 import cv2
 import numpy as np
 import csv
 import math
 from datetime import datetime
-from mouse_tracking import MouseTracker  # マウスの軌跡データ取得
-from scr.roboclaw_motor_library import motor_m1, motor_m2, motor_m3, motor_m4, stop_all  # モーター制御関数
+from mouse_tracking import MouseTracker
+from scr.roboclaw_motor_library import motor_m1, motor_m2, motor_m3, stop_all
 
-# カメラ設定
-CAMERA_INDEX = 1
+# =========================
+# カメラと表示設定
+# =========================
+CAMERA_INDEX = 0
 WIDTH = 640
 HEIGHT = 480
-FPS = 30
-DT = 1.0 / FPS
-PIXEL = 63.0 / 480.0
-WAIT = 1
+FPS_TARGET = 60
+WAIT = 1  # cv2.waitKey用
 
-# PID制御のゲイン
-K_P = 0.65   # 比例ゲイン
-K_I = 0.35   # 積分ゲイン
-K_D = 0.06  # PIDゲイン
+# クロップ（中央正方領域を抽出）
+CROP_LEFT = (WIDTH - HEIGHT) // 2
+CROP_RIGHT = CROP_LEFT + HEIGHT
+FRAME_CENTER = (HEIGHT // 2, HEIGHT // 2)  # (x,y)
 
-# マウス移動スケーリング（デバイスパスとスケール係数）
+# 画素→mm 変換
+PIXEL_MM = 63.0 / 480.0
+
+# =========================
+# マウス軌跡（任意の外部センサ）
+# =========================
 DEVICE_PATH = '/dev/input/event9'
 SCALING = 0.0172  # mm単位
 
-# クロップ範囲（中央の正方領域を抽出）
-CROP_LEFT = (WIDTH - HEIGHT) // 2
-CROP_RIGHT = CROP_LEFT + HEIGHT
-frame_center = (HEIGHT // 2, HEIGHT // 2)
+# =========================
+# 位置PIDゲイン（vx, vy生成）
+# =========================
+Kp_xy = 3.0
+Ki_xy = 0.7
+Kd_xy = 0.2
+I_LIM_XY = 50.0
 
-# グローバル変数（位置と積分用）
-mouse_x, mouse_y = 0.0, 0.0
-prev_offset_x = 0.0
-prev_offset_y = 0.0
+# =========================
+# 角度PIDゲイン（ω生成）
+# =========================
+Kp_psi = 0.0
+Ki_psi = 0.0
+Kd_psi = 0.0
+I_LIM_PSI = 20.0
+PSI_REF = 0.0  # 目標姿勢角［rad］
 
+# 角度の指数移動平均
+ANGLE_ALPHA = 0.2
+
+# =========================
+# 車輪配分と出力スケール
+# =========================
+THETA = np.radians([240.0, 120.0, 0.0])
+DIR_SGN = np.array([+1, +1, +1], dtype=float)
+R_SPIN = 1.0
+
+CMD_MAX = 127
+SPEED_TO_CMD = 0.5  # v_wheels[mm/s] → コマンド
+
+# =========================
 # ログ設定
-LOG_INTERVAL = 0.1  # 秒間隔
-MAX_DURATION = 30 * 60  # 最大測定時間：30分
-IDLE_THRESHOLD = 30.0   # 停止時間閾値：30秒
-MOVEMENT_EPSILON = 0.5  # 停止と見なす移動距離閾値（mm）
+# =========================
+RUN_DURATION = 10.0  # 計測時間10秒
+LOG_FILENAME = "step_response.csv"  # ステップ応答保存先
+LOG_EVERY_FRAME = True  # Trueなら毎フレーム，FalseならLOG_INTERVALで間引き
+LOG_INTERVAL = 0.01     # LOG_EVERY_FRAME=Falseのときに使用
 
-# マウス位置記録用
-prev_mouse_x, prev_mouse_y = 0.0, 0.0
-last_movement_time = time.time()
-
-# ログ一時保存リスト（後でCSV出力）
-log_entries = []
-
-# マウス位置の更新用コールバック関数
+# =========================
+# グローバル（コールバック更新）
+# =========================
+mouse_x, mouse_y = 0.0, 0.0
 def mouse_callback(x, y):
     global mouse_x, mouse_y
     mouse_x, mouse_y = x, y
 
-# カメラ初期化関数
+# =========================
+# ユーティリティ
+# =========================
+def wrap_pi(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
 def initialize_camera():
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -61,17 +99,15 @@ def initialize_camera():
     cv2.namedWindow('Track', flags=cv2.WINDOW_GUI_NORMAL)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, FPS)
+    cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('Y', 'U', 'Y', 'V'))
     return cap if cap.read()[0] else None
 
-# グレースケール変換＋2値化処理
 def gray_binary(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
     return binary
 
-# 最大輪郭とその中心点を取得
 def find_largest_contour(mask):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -84,116 +120,105 @@ def find_largest_contour(mask):
     cy = int(M["m01"] / M["m00"])
     return max_contour, (cx, cy)
 
-# 楕円フィッティング（最小5点必要）
 def fit_ellipse_if_possible(contour):
     if contour is not None and len(contour) >= 5:
         ellipse = cv2.fitEllipse(contour)
-        angle = ellipse[2]
+        angle_deg = ellipse[2]
         if ellipse[1][0] < ellipse[1][1]:
-            angle += 90
-        angle %= 180
-        angle_rad = math.radians(angle)
+            angle_deg += 90.0
+        angle_deg = angle_deg % 180.0
+        angle_rad = math.radians(angle_deg)
         return ellipse, angle_rad
     return None, None
 
-# オフセットとPIDによる速度計算
-def calculate_offset(center, frame_center, fps, angle_rad):
-    global prev_offset_x, prev_offset_y, integral_p, integral_n
-
-    if angle_rad is None:
-        angle_rad = 9.0
-
-    offset_x = (center[0] - frame_center[0]) * PIXEL
-    offset_y = (-center[1] + frame_center[1]) * PIXEL
-    offset_z = 300 * np.cos(angle_rad) / 4
-
-    position_p = offset_x + offset_y
-    position_n = offset_x - offset_y
-
-    integral_p += position_p * DT
-    integral_n += position_n * DT
-
-    prev_position_p = ((offset_x - prev_offset_x) + (offset_y - prev_offset_y)) / DT
-    prev_position_n = ((offset_x - prev_offset_x) - (offset_y - prev_offset_y)) / DT
-
-    drive_m1 = position_p 
-    drive_m2 = position_n 
-    drive_m3 = - position_n 
-    drive_m4 = - position_p 
-
-    speed_m1 = K_P * drive_m1 + K_I * integral_p + K_D * prev_position_p + offset_z
-    speed_m2 = K_P * drive_m2 + K_I * integral_n + K_D * prev_position_n + offset_z
-    speed_m3 = K_P * drive_m3 - K_I * integral_n - K_D * prev_position_n + offset_z
-    speed_m4 = K_P * drive_m4 - K_I * integral_p - K_D * prev_position_p + offset_z
-
-    prev_offset_x = offset_x
-    prev_offset_y = offset_y
-
-    return offset_x, offset_y, speed_m1, speed_m2, speed_m3, speed_m4
-
-# オーバーレイ描画関数（オフセット、角度、FPS、マウス位置）
-def draw_overlay(frame, center, offset_x, offset_y, ellipse, fps, angle_rad):
-    cv2.circle(frame, frame_center, 5, (255, 0, 0), -1)
-    if center:
+def draw_overlay(frame, center, ex, ey, ellipse, fps, psi_smooth, is_running, elapsed):
+    cv2.circle(frame, FRAME_CENTER, 5, (255, 0, 0), -1)
+    if center is not None:
         cv2.circle(frame, center, 5, (0, 255, 0), -1)
-        offset_text = f"(x,y)=({offset_x:.2f},{offset_y:.2f})"
-        cv2.putText(frame, offset_text, (10, 30), cv2.FONT_HERSHEY_COMPLEX, 0.6, (0, 0, 0), 2)
-    if ellipse is not None:
-        degrees = math.degrees(angle_rad)
-        angle_text = f"Angle: {degrees:.2f} rad"
-        cv2.putText(frame, angle_text, (10, 60), cv2.FONT_HERSHEY_COMPLEX, 0.6, (0, 0, 255), 2)
-    fps_text = f"FPS: {fps:.2f}"
-    cv2.putText(frame, fps_text, (10, 90), cv2.FONT_HERSHEY_COMPLEX, 0.6, (0, 0, 0), 2)
-    mouse_pos_text = f"trajectory_data (x,y): ({mouse_x:.2f}, {mouse_y:.2f})"
-    cv2.putText(frame, mouse_pos_text, (100, 400), cv2.FONT_HERSHEY_COMPLEX, 0.6, (0, 0, 0), 2)
+        cv2.putText(frame, f"(x,y)[mm]=({ex:.2f},{ey:.2f})", (10, 30),
+                    cv2.FONT_HERSHEY_COMPLEX, 0.6, (0, 0, 0), 2)
+    if ellipse is not None and psi_smooth is not None:
+        deg = math.degrees(psi_smooth)
+        cv2.putText(frame, f"Angle: {deg:.2f} deg", (10, 60),
+                    cv2.FONT_HERSHEY_COMPLEX, 0.6, (0, 0, 255), 2)
+    cv2.putText(frame, f"FPS: {fps:.2f}", (10, 90),
+                cv2.FONT_HERSHEY_COMPLEX, 0.6, (0, 0, 0), 2)
+    cv2.putText(frame, f"state: {'RUNNING' if is_running else 'IDLE'}  t={elapsed:.2f}s",
+                (10, 120), cv2.FONT_HERSHEY_COMPLEX, 0.6, (0, 0, 0), 2)
 
-# モーター速度送信
-def move_motors(speed_m1, speed_m2, speed_m3, speed_m4):
-    motor_m1(int(speed_m1))
-    motor_m2(int(speed_m2))
-    motor_m3(int(speed_m3))
-    motor_m4(int(speed_m4))
+def wheels_command_from_v(vx, vy, omega):
+    v_wheels = (-vx * np.sin(THETA) + vy * np.cos(THETA) + R_SPIN * omega) * DIR_SGN
+    cmds = np.clip(v_wheels * SPEED_TO_CMD, -CMD_MAX, CMD_MAX).astype(int)
+    return cmds, v_wheels
 
-# CSV初期化関数
-def initialize_csv_logger(filename="log9.csv"):
+def move_motors_cmds(cmds):
+    motor_m1(int(cmds[0]))
+    motor_m2(int(cmds[1]))
+    motor_m3(int(cmds[2]))
+
+def initialize_csv_logger(filename=LOG_FILENAME):
     with open(filename, mode="w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["time[s]", "mouse_x[mm]", "mouse_y[mm]", "angle_rad"])
+        writer.writerow([
+            "time[s]", "dt[s]", "fps",
+            "ex[mm]", "ey[mm]", "dex[mm/s]", "dey[mm/s]",
+            "ix", "iy",
+            "psi[rad]", "epsi[rad]", "psi_i", "dpsi[rad/s]",
+            "vx[mm/s]", "vy[mm/s]", "omega[rad/s]",
+            "cmd1", "cmd2", "cmd3",
+            "vwh1[mm/s]", "vwh2[mm/s]", "vwh3[mm/s]"
+        ])
 
-# 一時ログ保存（CSVに書く前のメモリ保持）
-def log_to_csv(filename, elapsed_time, mouse_x, mouse_y, angle_rad):
-    log_entries.append([
-        f"{elapsed_time:.1f}",
-        f"{mouse_x:.2f}",
-        f"{mouse_y:.2f}",
-        f"{angle_rad:.2f}" if angle_rad is not None else "-1.00"
+def log_to_csv_buffer(buf, **kw):
+    # kw から列順に抽出して追加
+    buf.append([
+        f"{kw['t']:.6f}", f"{kw['dt']:.6f}", f"{kw['fps']:.3f}",
+        f"{kw['ex']:.6f}", f"{kw['ey']:.6f}", f"{kw['dex']:.6f}", f"{kw['dey']:.6f}",
+        f"{kw['ix']:.6f}", f"{kw['iy']:.6f}",
+        f"{kw['psi']:.6f}", f"{kw['epsi']:.6f}", f"{kw['psi_i']:.6f}", f"{kw['dpsi']:.6f}",
+        f"{kw['vx']:.6f}", f"{kw['vy']:.6f}", f"{kw['omega']:.6f}",
+        int(kw['cmds'][0]), int(kw['cmds'][1]), int(kw['cmds'][2]),
+        f"{kw['vwh'][0]:.6f}", f"{kw['vwh'][1]:.6f}", f"{kw['vwh'][2]:.6f}",
     ])
 
-# ログをファイルに書き出し
-def flush_log_entries(filename):
+def flush_log_entries(filename, entries):
+    if not entries:
+        return
     with open(filename, mode="a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerows(log_entries)
+        writer.writerows(entries)
+    entries.clear()
 
-# メイン処理開始
+# =========================
+# メイン
+# =========================
 if __name__ == "__main__":
+    # マウストラッカー開始
     mouse_tracker = MouseTracker(DEVICE_PATH, SCALING)
     mouse_tracker.start(callback=mouse_callback)
 
-    initialize_csv_logger("log9.csv")
+    initialize_csv_logger(LOG_FILENAME)
+    log_entries = []
 
     cap = initialize_camera()
     if not cap:
-        print("カメラが開けない")
+        print("カメラが開けない．")
         mouse_tracker.stop()
         exit()
 
-    prev_time = time.time()
-    integral_p = 0.0
-    integral_n = 0.0
-    is_logging = False
-    start_log_time = None
+    # ===== PID状態（未開始＝IDLE時は積分・微分を計算しない）=====
+    ix = iy = 0.0
+    ex_prev = ey_prev = None  # Noneにして開始時の微分を0に
+    psi_i = 0.0
+    psi_prev = None
+    psi_smooth = None
+
+    # ===== 実行・計測フラグ =====
+    is_running = False  # 's' 押下で True
+    start_time = None   # 駆動開始時刻
     last_log_time = 0.0
+
+    prev_time = time.time()
 
     try:
         while True:
@@ -201,67 +226,139 @@ if __name__ == "__main__":
             if not ret:
                 break
 
-            current_time = time.time()
-            fps = 1.0 / (current_time - prev_time)
-            prev_time = current_time
+            now = time.time()
+            dt = now - prev_time
+            dt = clamp(dt, 1e-3, 0.1)
+            prev_time = now
+            fps = 1.0 / dt
 
+            # 画像処理
             frame_cropped = frame[:, CROP_LEFT:CROP_RIGHT]
             mask = gray_binary(frame_cropped)
             contour, center = find_largest_contour(mask)
             ellipse, angle_rad = fit_ellipse_if_possible(contour)
 
-            if center is not None:
-                offset_x, offset_y, speed_m1, speed_m2, speed_m3, speed_m4 = calculate_offset(
-                    center, frame_center, fps, angle_rad
-                )
-                draw_overlay(frame_cropped, center, offset_x, offset_y, ellipse, fps, angle_rad)
-                move_motors(speed_m1, speed_m2, speed_m3, speed_m4)
+            # 角度の前処理
+            if angle_rad is not None:
+                psi_raw = wrap_pi(angle_rad)
+                if psi_smooth is None:
+                    psi_smooth = psi_raw
+                else:
+                    d = wrap_pi(psi_raw - psi_smooth)
+                    psi_smooth = wrap_pi(psi_smooth + ANGLE_ALPHA * d)
             else:
-                draw_overlay(frame_cropped, None, 0.0, 0.0, ellipse, fps, angle_rad)
+                psi_raw = psi_smooth
+
+            # 中心からの誤差
+            if center is not None:
+                ex = (center[0] - FRAME_CENTER[0]) * PIXEL_MM
+                ey = (center[1] - FRAME_CENTER[1]) * PIXEL_MM
+            else:
+                ex = ey = 0.0  # ターゲット喪失時は0扱い（安全側）
+            
+            # 実行状態の時間
+            elapsed = 0.0 if not is_running else (now - start_time)
+
+            # ===== 制御計算 =====
+            if is_running:
+                # 積分更新（アンチワインドアップ）
+                ix = clamp(ix + ex * dt, -I_LIM_XY, I_LIM_XY)
+                iy = clamp(iy + ey * dt, -I_LIM_XY, I_LIM_XY)
+
+                # 微分（開始直後は0）
+                if ex_prev is None:
+                    dex = 0.0
+                    dey = 0.0
+                else:
+                    dex = (ex - ex_prev) / dt
+                    dey = (ey - ey_prev) / dt
+                ex_prev, ey_prev = ex, ey
+
+                vx = Kp_xy * ex + Ki_xy * ix + Kd_xy * dex
+                vy = Kp_xy * ey + Ki_xy * iy + Kd_xy * dey
+
+                # 角度制御
+                if psi_raw is None:
+                    epsi = 0.0
+                    dpsi = 0.0
+                    omega = 0.0
+                else:
+                    epsi = wrap_pi(PSI_REF - psi_smooth)
+                    psi_i = clamp(psi_i + epsi * dt, -I_LIM_PSI, I_LIM_PSI)
+                    if psi_prev is None:
+                        dpsi = 0.0
+                    else:
+                        dpsi = wrap_pi(psi_smooth - psi_prev) / dt
+                    omega = Kp_psi * epsi + Ki_psi * psi_i - Kd_psi * dpsi
+                    psi_prev = psi_smooth
+
+                # 各輪コマンド
+                cmds, vwh = wheels_command_from_v(vx, vy, omega)
+                move_motors_cmds(cmds)
+
+                # ロギング（毎フレームまたは間引き）
+                do_log = LOG_EVERY_FRAME or ((now - last_log_time) >= LOG_INTERVAL)
+                if do_log:
+                    log_to_csv_buffer(
+                        log_entries,
+                        t=elapsed, dt=dt, fps=fps,
+                        ex=ex, ey=ey, dex=dex, dey=dey,
+                        ix=ix, iy=iy,
+                        psi=(psi_smooth if psi_smooth is not None else 0.0),
+                        epsi=epsi, psi_i=psi_i, dpsi=dpsi,
+                        vx=vx, vy=vy, omega=omega,
+                        cmds=cmds, vwh=vwh
+                    )
+                    last_log_time = now
+
+                # 10秒経過で停止
+                if elapsed >= RUN_DURATION:
+                    print("10秒経過．自動停止しCSVをフラッシュします．")
+                    flush_log_entries(LOG_FILENAME, log_entries)
+                    stop_all()
+                    is_running = False  # 停止してIDLEへ戻す
+
+            else:
+                # IDLE：出力ゼロ，PID積分・微分は計算しない
                 stop_all()
+                # 開始前は積分・微分状態を保持せず常に初期化
+                ix = iy = 0.0
+                ex_prev = ey_prev = None
+                psi_i = 0.0
+                psi_prev = None
+                # vx,vy,omega,cmdsは表示用に0
+                vx = vy = omega = 0.0
+                cmds = np.array([0, 0, 0], dtype=int)
 
-            # 停止状態の検出
-            movement = math.hypot(mouse_x - prev_mouse_x, mouse_y - prev_mouse_y)
-            if movement > MOVEMENT_EPSILON:
-                last_movement_time = current_time
-            prev_mouse_x, prev_mouse_y = mouse_x, mouse_y
+            # オーバレイ描画
+            draw_overlay(frame_cropped, center, ex, ey, ellipse, fps, psi_smooth, is_running, elapsed)
 
-            # ログ記録の管理
-            if is_logging:
-                elapsed_time = current_time - start_log_time
-                if elapsed_time >= MAX_DURATION:
-                    print("30分経過のためログ停止")
-                    flush_log_entries("log9.csv")
-                    break
-                elif current_time - last_movement_time >= IDLE_THRESHOLD:
-                    print("30秒以上停止状態のためログ停止")
-                    flush_log_entries("log9.csv")
-                    break
-                elif current_time - last_log_time >= LOG_INTERVAL:
-                    log_to_csv("log9.csv", elapsed_time, mouse_x, mouse_y, angle_rad if angle_rad is not None else -1.0)
-                    last_log_time = current_time
-
-            # 画面表示とキー操作
+            # 画面表示とキー
             cv2.imshow("Track", frame_cropped)
             key = cv2.waitKey(WAIT) & 0xFF
+
             if key == ord('q'):
-                if is_logging:
-                    flush_log_entries("log9.csv")
+                # 強制終了
+                if log_entries:
+                    flush_log_entries(LOG_FILENAME, log_entries)
                 break
-            elif key == ord('s') and not is_logging:
-                print("ロギング開始")
-                is_logging = True
-                mouse_callback(0, 0)
-                start_log_time = current_time
-                last_log_time = current_time
-                prev_mouse_x, prev_mouse_y = mouse_x, mouse_y
-                last_movement_time = current_time
+
+            elif key == ord('s') and not is_running:
+                # ===== ステップ応答開始 =====
+                print("駆動とログを開始します（10秒）．")
+                # 状態リセット（開始時の微分を0にする）
+                ix = iy = 0.0
+                ex_prev = ey_prev = None
+                psi_i = 0.0
+                psi_prev = None
+                start_time = now
+                last_log_time = now
+                is_running = True
 
     finally:
         stop_all()
         cap.release()
         cv2.destroyAllWindows()
         mouse_tracker.stop()
-        if is_logging:
-            flush_log_entries("log9.csv")
-        print("プログラム終了")
+        flush_log_entries(LOG_FILENAME, log_entries)
+        print("プログラム終了．")
